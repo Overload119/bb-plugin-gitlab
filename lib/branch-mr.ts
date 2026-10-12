@@ -19,9 +19,19 @@ export interface BranchMergeRequest {
   draft: boolean;
   /** GitLab head-pipeline status (success, failed, running, …) or null. */
   pipeline: string | null;
+  pipelineUrl: string | null;
   /** GitLab `detailed_merge_status` (mergeable, not_approved, conflict, …). */
   mergeStatus: string;
   hasConflicts: boolean;
+  /** Resolvable discussions with an unresolved note; null when unknown. */
+  unresolvedThreads: number | null;
+  approvalsRequired: number | null;
+  approvalsLeft: number | null;
+  approvedBy: string[];
+  reviewers: string[];
+  author: string;
+  sourceBranch: string;
+  targetBranch: string;
   updatedAt: string;
 }
 
@@ -62,15 +72,14 @@ export function normalizeMrState(state: string): BranchMrState {
     : "opened";
 }
 
-export type BadgeTone =
-  | "merged"
-  | "closed"
-  | "draft"
-  | "failed"
-  | "running"
-  | "attention"
-  | "ready"
-  | "open";
+/**
+ * Open MRs get one of three colors:
+ * - red: merge conflict or failed pipeline
+ * - yellow: unresolved review threads
+ * - green: neither
+ * Merged and closed MRs are muted; they no longer need anything.
+ */
+export type BadgeTone = "red" | "yellow" | "green" | "merged" | "closed";
 
 export interface MrBadge {
   tone: BadgeTone;
@@ -78,19 +87,9 @@ export interface MrBadge {
   icon: string;
   /** Short text after the icon, e.g. "!1234". */
   text: string;
-  /** Hover text: one line per fact. */
-  title: string;
+  /** One-line reason for the color, e.g. "pipeline failed". */
+  summary: string;
 }
-
-const PIPELINE_FAILED = new Set(["failed", "canceled"]);
-const PIPELINE_RUNNING = new Set([
-  "running",
-  "pending",
-  "created",
-  "preparing",
-  "waiting_for_resource",
-  "scheduled",
-]);
 
 const MERGE_STATUS_LABELS: Record<string, string> = {
   mergeable: "ready to merge",
@@ -114,58 +113,42 @@ export function describeMergeStatus(status: string): string {
   return MERGE_STATUS_LABELS[status] ?? status.replaceAll("_", " ");
 }
 
-/** One badge per merge request, most urgent fact first. */
+export function hasMergeConflict(mr: BranchMergeRequest): boolean {
+  return mr.hasConflicts || mr.mergeStatus === "conflict";
+}
+
+export function pipelineFailed(mr: BranchMergeRequest): boolean {
+  return mr.pipeline === "failed";
+}
+
+export function hasUnresolvedThreads(mr: BranchMergeRequest): boolean {
+  return mr.unresolvedThreads !== null
+    ? mr.unresolvedThreads > 0
+    : mr.mergeStatus === "discussions_not_resolved";
+}
+
 export function badgeFor(mr: BranchMergeRequest): MrBadge {
   const text = `!${mr.iid}`;
-  const lines = [`!${mr.iid} ${mr.title}`];
-  const facts: string[] = [];
-  let tone: BadgeTone;
-  let icon: string;
-
   if (mr.state === "merged") {
-    tone = "merged";
-    icon = "GitMerge";
-    facts.push("merged");
-  } else if (mr.state === "closed" || mr.state === "locked") {
-    tone = "closed";
-    icon = "GitPullRequestClosed";
-    facts.push(mr.state);
-  } else {
-    facts.push(mr.draft ? "draft" : "open");
-    if (mr.pipeline !== null) facts.push(`pipeline ${mr.pipeline}`);
-    const status = mr.hasConflicts ? "conflict" : mr.mergeStatus;
-    if (status.length > 0 && status !== "draft_status") {
-      facts.push(describeMergeStatus(status));
-    }
-    if (mr.pipeline !== null && PIPELINE_FAILED.has(mr.pipeline)) {
-      tone = "failed";
-      icon = "GitPullRequestArrow";
-    } else if (mr.hasConflicts || status === "conflict" || status === "need_rebase") {
-      tone = "failed";
-      icon = "GitPullRequestArrow";
-    } else if (mr.draft) {
-      tone = "draft";
-      icon = "GitPullRequestDraft";
-    } else if (mr.pipeline !== null && PIPELINE_RUNNING.has(mr.pipeline)) {
-      tone = "running";
-      icon = "GitPullRequestArrow";
-    } else if (status === "mergeable") {
-      tone = "ready";
-      icon = "GitPullRequestArrow";
-    } else if (
-      status === "not_approved" ||
-      status === "discussions_not_resolved" ||
-      status === "requested_changes"
-    ) {
-      tone = "attention";
-      icon = "GitPullRequestArrow";
-    } else {
-      tone = "open";
-      icon = "GitPullRequestArrow";
-    }
+    return { tone: "merged", icon: "GitMerge", text, summary: "merged" };
   }
-  lines.push(facts.join(" · "));
-  return { tone, icon, text, title: lines.join("\n") };
+  if (mr.state === "closed" || mr.state === "locked") {
+    return { tone: "closed", icon: "GitPullRequestClosed", text, summary: mr.state };
+  }
+  const icon = mr.draft ? "GitPullRequestDraft" : "GitPullRequestArrow";
+  const red: string[] = [];
+  if (hasMergeConflict(mr)) red.push("merge conflict");
+  if (pipelineFailed(mr)) red.push("pipeline failed");
+  if (red.length > 0) return { tone: "red", icon, text, summary: red.join(" · ") };
+  if (hasUnresolvedThreads(mr)) {
+    const count = mr.unresolvedThreads;
+    const summary =
+      count === null
+        ? "unresolved threads"
+        : `${count} unresolved thread${count === 1 ? "" : "s"}`;
+    return { tone: "yellow", icon, text, summary };
+  }
+  return { tone: "green", icon, text, summary: "no conflicts, failures, or open threads" };
 }
 
 /** Cache key for a (BB project, branch) pair; NUL never appears in either. */

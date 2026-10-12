@@ -180,8 +180,17 @@ const branchMergeRequestSchema = z
     state: z.enum(["opened", "merged", "closed", "locked"]),
     draft: z.boolean(),
     pipeline: z.string().nullable(),
+    pipelineUrl: z.string().nullable(),
     mergeStatus: z.string(),
     hasConflicts: z.boolean(),
+    unresolvedThreads: z.number().int().nonnegative().nullable(),
+    approvalsRequired: z.number().int().nonnegative().nullable(),
+    approvalsLeft: z.number().int().nonnegative().nullable(),
+    approvedBy: z.array(z.string()),
+    reviewers: z.array(z.string()),
+    author: z.string(),
+    sourceBranch: z.string(),
+    targetBranch: z.string(),
     updatedAt: z.string(),
   })
   .strict();
@@ -1441,13 +1450,28 @@ export default async function plugin(bb: BbPluginApi) {
       rows.filter((row) => row !== null),
     );
     if (picked === null) return null;
+    const open = picked.state === "opened";
+    const mrBase = `${base}/${picked.iid}`;
+    const optional = async (endpoint: string): Promise<unknown> => {
+      try {
+        return await gitlabApi(project, endpoint);
+      } catch {
+        return undefined;
+      }
+    };
     // The list endpoint omits head_pipeline; the single-MR read carries it
-    // along with a fresh detailed_merge_status. Closed/merged MRs skip it.
-    const detail = gitlabMergeRequestRowSchema.parse(
-      picked.state === "opened"
-        ? await gitlabApi(project, `${base}/${picked.iid}`)
-        : picked,
-    );
+    // along with a fresh detailed_merge_status. Open MRs also need their
+    // review threads and approvals; closed/merged MRs skip all three calls.
+    const [detailRaw, unresolvedThreads, approvalsRaw] = open
+      ? await Promise.all([
+          gitlabApi(project, mrBase),
+          countUnresolvedThreads(project, mrBase),
+          optional(`${mrBase}/approvals`),
+        ])
+      : [picked, null, undefined];
+    const detail = gitlabMergeRequestRowSchema.parse(detailRaw);
+    const approvals =
+      approvalsRaw === undefined ? null : gitlabApprovalsSchema.parse(approvalsRaw);
     return {
       project,
       iid: detail.iid,
@@ -1456,10 +1480,52 @@ export default async function plugin(bb: BbPluginApi) {
       state: normalizeMrState(detail.state),
       draft: detail.draft || detail.work_in_progress,
       pipeline: detail.head_pipeline?.status || null,
+      pipelineUrl: detail.head_pipeline?.web_url || null,
       mergeStatus: detail.detailed_merge_status || detail.merge_status,
       hasConflicts: detail.has_conflicts,
+      unresolvedThreads,
+      approvalsRequired: approvals?.approvals_required ?? null,
+      approvalsLeft: approvals?.approvals_left ?? null,
+      approvedBy: (approvals?.approved_by ?? [])
+        .map((entry) => entry.user?.username ?? "")
+        .filter((name) => name.length > 0),
+      reviewers: usernames(detail.reviewers),
+      author: detail.author?.username ?? "",
+      sourceBranch: detail.source_branch,
+      targetBranch: detail.target_branch,
       updatedAt: detail.updated_at,
     };
+  }
+
+  /**
+   * Discussions with at least one resolvable, unresolved note — what GitLab
+   * shows as "N unresolved threads". Null when the read fails, so the badge
+   * falls back to detailed_merge_status instead of claiming zero.
+   */
+  async function countUnresolvedThreads(
+    project: string,
+    mrBase: string,
+  ): Promise<number | null> {
+    const PAGE = 100;
+    let count = 0;
+    try {
+      for (let page = 1; page <= 10; page++) {
+        const raw = await gitlabApi(
+          project,
+          `${mrBase}/discussions?per_page=${PAGE}&page=${page}`,
+        );
+        const discussions = gitlabDiscussionListSchema.parse(raw);
+        for (const discussion of discussions) {
+          if (discussion.notes.some((note) => note.resolvable && !note.resolved)) {
+            count += 1;
+          }
+        }
+        if (!Array.isArray(raw) || raw.length < PAGE) break;
+      }
+      return count;
+    } catch {
+      return null;
+    }
   }
 
   function cachedBranchMergeRequest(

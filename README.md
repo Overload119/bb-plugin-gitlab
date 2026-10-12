@@ -43,14 +43,15 @@ thread links survive it.
   a review thread on the merge request) in the matching BB project. The item
   then shows a ⚡ pill linking to the thread.
 - **Sidebar MR badges** (fork addition): every thread row whose branch has a
-  merge request shows `!<iid>` after its title, colored by state — green ready
-  to merge, blue open, orange needs approval / unresolved threads, yellow
-  pipeline running, red failed pipeline or conflicts, gray draft/closed,
-  purple merged. Hover for title and status; click to open the MR. bb's own
-  pull-request lookup only runs `gh`, so this fills the gap for GitLab. The
-  branch comes from bb's environment record and `glab` runs on the bb server,
-  so threads on any machine (devboxes included) get badges. Lookups are
-  batched and cached for a minute.
+  merge request shows `!<iid>` after its title. Open MRs are red for a merge
+  conflict or failed pipeline, yellow for unresolved review threads, and
+  green otherwise; merged MRs are purple and closed ones gray. Hovering opens
+  a card with branch, conflicts, pipeline (linked), unresolved thread count,
+  approvals, GitLab's merge status, reviewers, author, and last update.
+  Clicking opens the MR. bb's own pull-request lookup only runs `gh`, so this
+  fills the gap for GitLab. The branch comes from bb's environment record and
+  `glab` runs on the bb server, so threads on any machine (devboxes included)
+  get badges. Lookups are batched and cached for a minute.
 - **Homepage section**: recent open issues with the same Send agent buttons.
 - **Mentions**: `#` completes GitLab issues, `!` completes merge requests (`@`
   does both); the selected item's title, state, and description are attached as

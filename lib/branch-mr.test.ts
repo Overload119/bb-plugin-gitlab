@@ -14,7 +14,16 @@ const base: BranchMergeRequest = {
   draft: false,
   pipeline: "success",
   mergeStatus: "mergeable",
+  pipelineUrl: null,
   hasConflicts: false,
+  unresolvedThreads: 0,
+  approvalsRequired: 1,
+  approvalsLeft: 0,
+  approvedBy: ["rio"],
+  reviewers: [],
+  author: "dana",
+  sourceBranch: "dana/login",
+  targetBranch: "master",
   updatedAt: "2026-10-01T00:00:00Z",
 };
 
@@ -41,38 +50,54 @@ describe("pickBranchMergeRequest", () => {
 });
 
 describe("badgeFor", () => {
-  it("marks a mergeable, green MR ready", () => {
-    const badge = badgeFor(base);
-    expect(badge).toMatchObject({ tone: "ready", text: "!42" });
-    expect(badge.title).toContain("ready to merge");
+  it("is green with no conflicts, failures, or open threads", () => {
+    expect(badgeFor(base)).toMatchObject({ tone: "green", text: "!42" });
   });
 
-  it("puts a failed pipeline above everything else on an open MR", () => {
-    expect(badgeFor({ ...base, draft: true, pipeline: "failed" }).tone).toBe("failed");
+  it("stays green when only approval is missing", () => {
+    expect(badgeFor({ ...base, mergeStatus: "not_approved", approvalsLeft: 1 }).tone).toBe(
+      "green",
+    );
   });
 
-  it("flags conflicts", () => {
-    expect(badgeFor({ ...base, hasConflicts: true }).tone).toBe("failed");
+  it("is red on a failed pipeline, even with unresolved threads", () => {
+    const badge = badgeFor({ ...base, pipeline: "failed", unresolvedThreads: 2 });
+    expect(badge).toMatchObject({ tone: "red", summary: "pipeline failed" });
   });
 
-  it("shows drafts as drafts", () => {
-    const badge = badgeFor({ ...base, draft: true, mergeStatus: "draft_status" });
-    expect(badge.tone).toBe("draft");
-    expect(badge.icon).toBe("GitPullRequestDraft");
+  it("is red on a merge conflict", () => {
+    expect(badgeFor({ ...base, hasConflicts: true }).summary).toBe("merge conflict");
+    expect(badgeFor({ ...base, mergeStatus: "conflict" }).tone).toBe("red");
   });
 
-  it("shows running pipelines", () => {
+  it("names both red reasons", () => {
+    expect(badgeFor({ ...base, hasConflicts: true, pipeline: "failed" }).summary).toBe(
+      "merge conflict · pipeline failed",
+    );
+  });
+
+  it("is yellow with unresolved threads", () => {
+    expect(badgeFor({ ...base, unresolvedThreads: 1 })).toMatchObject({
+      tone: "yellow",
+      summary: "1 unresolved thread",
+    });
+    expect(badgeFor({ ...base, unresolvedThreads: 3 }).summary).toBe("3 unresolved threads");
+  });
+
+  it("falls back to GitLab's merge status when the thread count is unknown", () => {
     expect(
-      badgeFor({ ...base, pipeline: "running", mergeStatus: "ci_still_running" }).tone,
-    ).toBe("running");
+      badgeFor({ ...base, unresolvedThreads: null, mergeStatus: "discussions_not_resolved" })
+        .tone,
+    ).toBe("yellow");
+    expect(badgeFor({ ...base, unresolvedThreads: null }).tone).toBe("green");
   });
 
-  it("asks for attention when approval is missing", () => {
-    expect(badgeFor({ ...base, mergeStatus: "not_approved" }).tone).toBe("attention");
+  it("uses the draft icon for drafts", () => {
+    expect(badgeFor({ ...base, draft: true }).icon).toBe("GitPullRequestDraft");
   });
 
-  it("shows merged and closed MRs", () => {
-    expect(badgeFor({ ...base, state: "merged" })).toMatchObject({
+  it("mutes merged and closed MRs", () => {
+    expect(badgeFor({ ...base, state: "merged", pipeline: "failed" })).toMatchObject({
       tone: "merged",
       icon: "GitMerge",
     });
