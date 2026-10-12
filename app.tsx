@@ -37,6 +37,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { gitlabRpcContract } from "./server";
+import { SidebarMergeRequestBadges } from "@/components/sidebar-mr-badges";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -2647,5 +2648,9 @@ export default definePluginApp((app) => {
     title: "Merge request",
     icon: "GitMerge",
     component: MergeRequestPanelTab,
+  });
+  app.slots.experimental_appOverlay({
+    id: "sidebar-mr-badges",
+    component: SidebarMergeRequestBadges,
   });
 });

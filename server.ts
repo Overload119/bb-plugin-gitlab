@@ -16,6 +16,12 @@
 import { execFile } from "node:child_process";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import {
+  branchKey,
+  normalizeMrState,
+  pickBranchMergeRequest,
+  type BranchMergeRequest,
+} from "./lib/branch-mr";
 
 const SYNC_INTERVAL_MS = 5 * 60_000;
 const ISSUE_PAGE = 100;
@@ -165,6 +171,21 @@ const mergeRequestSchema = z
   })
   .strict();
 
+const branchMergeRequestSchema = z
+  .object({
+    project: projectRefSchema,
+    iid: iidSchema,
+    title: z.string(),
+    url: z.string(),
+    state: z.enum(["opened", "merged", "closed", "locked"]),
+    draft: z.boolean(),
+    pipeline: z.string().nullable(),
+    mergeStatus: z.string(),
+    hasConflicts: z.boolean(),
+    updatedAt: z.string(),
+  })
+  .strict();
+
 export const gitlabRpcContract = defineRpcContract({
   status: {
     input: z.null(),
@@ -281,6 +302,40 @@ export const gitlabRpcContract = defineRpcContract({
     input: z.null(),
     output: z
       .object({ links: z.record(z.string(), z.array(threadLinkSchema)) })
+      .strict(),
+  },
+  /**
+   * (BB project, branch) pairs → the merge request each branch stands for.
+   * Drives the sidebar row badges; one batched call per sidebar refresh.
+   */
+  branchMergeRequests: {
+    input: z
+      .object({
+        items: z
+          .array(
+            z
+              .object({
+                projectId: z.string().min(1),
+                branch: z.string().min(1).max(255),
+              })
+              .strict(),
+          )
+          .max(500),
+        force: z.boolean().optional(),
+      })
+      .strict(),
+    output: z
+      .object({
+        results: z.array(
+          z
+            .object({
+              projectId: z.string(),
+              branch: z.string(),
+              mergeRequest: branchMergeRequestSchema.nullable(),
+            })
+            .strict(),
+        ),
+      })
       .strict(),
   },
 });
@@ -1356,6 +1411,108 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // ------------------------------------------------------------------
+  // Branch → merge request lookups for the sidebar row badges. bb's native
+  // pull-request lookup only runs `gh`, so GitLab threads get nothing there.
+  // Results are cached per (GitLab project, branch) for a minute; a miss
+  // (no MR on the branch) is cached too, so idle sidebars stay cheap.
+  // ------------------------------------------------------------------
+  const BRANCH_MR_TTL_MS = 60_000;
+  const BRANCH_MR_CONCURRENCY = 4;
+  const branchMrCache = new Map<
+    string,
+    { value: BranchMergeRequest | null; fetchedAt: number }
+  >();
+  const branchMrInFlight = new Map<string, Promise<BranchMergeRequest | null>>();
+
+  async function lookupBranchMergeRequest(
+    project: string,
+    branch: string,
+  ): Promise<BranchMergeRequest | null> {
+    const { path } = parseProjectRef(project);
+    const base = `projects/${encodeURIComponent(path)}/merge_requests`;
+    const rows = gitlabItemListSchema.parse(
+      await gitlabApi(
+        project,
+        `${base}?source_branch=${encodeURIComponent(branch)}&state=all` +
+          "&order_by=updated_at&sort=desc&per_page=10",
+      ),
+    );
+    const picked = pickBranchMergeRequest(
+      rows.filter((row) => row !== null),
+    );
+    if (picked === null) return null;
+    // The list endpoint omits head_pipeline; the single-MR read carries it
+    // along with a fresh detailed_merge_status. Closed/merged MRs skip it.
+    const detail = gitlabMergeRequestRowSchema.parse(
+      picked.state === "opened"
+        ? await gitlabApi(project, `${base}/${picked.iid}`)
+        : picked,
+    );
+    return {
+      project,
+      iid: detail.iid,
+      title: detail.title,
+      url: detail.web_url,
+      state: normalizeMrState(detail.state),
+      draft: detail.draft || detail.work_in_progress,
+      pipeline: detail.head_pipeline?.status || null,
+      mergeStatus: detail.detailed_merge_status || detail.merge_status,
+      hasConflicts: detail.has_conflicts,
+      updatedAt: detail.updated_at,
+    };
+  }
+
+  function cachedBranchMergeRequest(
+    project: string,
+    branch: string,
+    force: boolean,
+  ): Promise<BranchMergeRequest | null> {
+    const key = branchKey(project, branch);
+    const hit = branchMrCache.get(key);
+    if (!force && hit !== undefined && Date.now() - hit.fetchedAt < BRANCH_MR_TTL_MS) {
+      return Promise.resolve(hit.value);
+    }
+    const pending = branchMrInFlight.get(key);
+    if (pending !== undefined) return pending;
+    const request = lookupBranchMergeRequest(project, branch)
+      .then((value) => {
+        branchMrCache.set(key, { value, fetchedAt: Date.now() });
+        return value;
+      })
+      .catch((error: unknown) => {
+        bb.log.debug(
+          `branch MR lookup ${project}@${branch} failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        // Keep showing the last good answer through a transient failure.
+        return hit?.value ?? null;
+      })
+      .finally(() => branchMrInFlight.delete(key));
+    branchMrInFlight.set(key, request);
+    return request;
+  }
+
+  async function mapLimited<T, R>(
+    items: readonly T[],
+    limit: number,
+    fn: (item: T) => Promise<R>,
+  ): Promise<R[]> {
+    const results = new Array<R>(items.length);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < items.length) {
+        const index = next++;
+        results[index] = await fn(items[index]);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(limit, items.length) }, worker),
+    );
+    return results;
+  }
+
+  // ------------------------------------------------------------------
   // rpc — the frontend data plane.
   // ------------------------------------------------------------------
   bb.rpc.register(gitlabRpcContract, {
@@ -1766,6 +1923,42 @@ export default async function plugin(bb: BbPluginApi) {
     /** () → every issue/MR → thread link, keyed "<kind>:<project>!<iid>". */
     async listLinks() {
       return { links: await listAllLinks() };
+    },
+
+    /** [(BB project, branch)] → the merge request on each branch, or null. */
+    async branchMergeRequests({ items, force }) {
+      if (authenticatedHosts.length === 0) {
+        try {
+          await checkAuth();
+        } catch {
+          return {
+            results: items.map((item) => ({ ...item, mergeRequest: null })),
+          };
+        }
+      }
+      const refByBbProject = new Map<string, string>();
+      for (const info of await discoverProjects()) {
+        if (info.bbProjectId !== null && !refByBbProject.has(info.bbProjectId)) {
+          refByBbProject.set(info.bbProjectId, info.project);
+        }
+      }
+      const unique = new Map<string, { projectId: string; branch: string }>();
+      for (const item of items) {
+        unique.set(branchKey(item.projectId, item.branch), item);
+      }
+      const resolved = await mapLimited(
+        [...unique.values()],
+        BRANCH_MR_CONCURRENCY,
+        async (item) => {
+          const ref = refByBbProject.get(item.projectId);
+          const mergeRequest =
+            ref === undefined
+              ? null
+              : await cachedBranchMergeRequest(ref, item.branch, force === true);
+          return { ...item, mergeRequest };
+        },
+      );
+      return { results: resolved };
     },
   });
 
